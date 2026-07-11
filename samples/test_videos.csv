@@ -1,0 +1,9 @@
+dataset,video_name,relative_input_path,frames,width,height,fps,annotation_file
+Buoy,buoyGT_2_5_3_5,samples/Buoy/buoyGT_2_5_3_5.avi,98,800,600,25.0,samples/annotations/Buoy/buoyGT_2_5_3_5HorizonGT.mat
+Buoy,buoyGT_2_6_3_1,samples/Buoy/buoyGT_2_6_3_1.avi,98,800,600,25.0,samples/annotations/Buoy/buoyGT_2_6_3_1HorizonGT.mat
+SMD,MVI_0788_VIS_OB,samples/SMD/MVI_0788_VIS_OB.mp4,299,1920,1080,30.0,samples/annotations/SMD/MVI_0788_VIS_OB_HorizonGT.mat
+SMD,MVI_0790_VIS_OB,samples/SMD/MVI_0790_VIS_OB.mp4,299,1920,1080,30.0,samples/annotations/SMD/MVI_0790_VIS_OB_HorizonGT.mat
+TMD,TMD_annotated_15,samples/TMD/TMD_annotated_15.avi,371,1920,1080,29.607,samples/annotations/TMD/TMD_annotated_15.npy
+TMD,TMD_annotated_16,samples/TMD/TMD_annotated_16.avi,322,1920,1080,29.607,samples/annotations/TMD/TMD_annotated_16.npy
+TMD,TMD_annotated_17,samples/TMD/TMD_annotated_17.avi,363,1920,1080,29.608,samples/annotations/TMD/TMD_annotated_17.npy
+TMD,TMD_annotated_5,samples/TMD/TMD_annotated_5.avi,346,1920,1080,29.612,samples/annotations/TMD/TMD_annotated_5.npy
