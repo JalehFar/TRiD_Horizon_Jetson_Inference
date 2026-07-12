@@ -1,34 +1,21 @@
-# Test Data
+# Included Test Data
 
-`samples/test_manifest.csv` contains every frame from the final held-out test split:
+This repository includes the complete final held-out test split:
 
 - Buoy: 2 videos, 196 frames
 - SMD: 2 videos, 598 frames
 - TMD: 4 videos, 1402 frames
 - Total: 8 videos, 2196 frames
 
-The video files are not copied into this repository because the complete test videos are large and are better stored outside Git.
+The manifest is `samples/test_manifest.csv`. Every `relative_input_path` points to a video file included inside this repository.
 
-Expected layout after preparing data:
+Included videos:
 
-```text
-samples/
-  Buoy/<test video>.avi
-  SMD/<test video>.mp4
-  TMD/<test video>.avi
-  annotations/<dataset>/<annotation sidecar>
-  test_manifest.csv
-  test_videos.csv
-```
-
-To copy or symlink videos from an external dataset folder:
-
-```bash
-python3 tools/prepare_test_data.py --source-root /path/to/HL --symlink
-```
-
-If checksums for local source videos are required, compute them after preparation with:
-
-```bash
-sha256sum samples/Buoy/* samples/SMD/* samples/TMD/*
-```
+- `samples/Buoy/buoyGT_2_5_3_5.avi`
+- `samples/Buoy/buoyGT_2_6_3_1.avi`
+- `samples/SMD/MVI_0788_VIS_OB.mp4`
+- `samples/SMD/MVI_0790_VIS_OB.mp4`
+- `samples/TMD/TMD_annotated_5.avi`
+- `samples/TMD/TMD_annotated_15.avi`
+- `samples/TMD/TMD_annotated_16.avi`
+- `samples/TMD/TMD_annotated_17.avi`

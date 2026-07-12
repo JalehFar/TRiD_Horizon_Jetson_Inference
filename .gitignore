@@ -4,12 +4,11 @@ __pycache__/
 .venv/
 venv/
 env/
-outputs/
+outputs/*
+!outputs/.gitkeep
 logs/
 *.log
 *.tmp
-*.avi
-*.mp4
 *.mov
 *.mkv
 .DS_Store

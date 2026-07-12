@@ -1,178 +1,102 @@
 # TRiD-Horizon Jetson Inference
 
-Minimal inference-only repository for final horizon-line detection methods:
+Self-contained inference and benchmarking repository for the final horizon-line detection methods. The complete final test set is included under `samples/`, so no external dataset-preparation step is required.
 
-- `ESSLD`: DCEUNet segmentation, mask-derived coarse line, bounded ROI refinement.
-- `DirectReg-HL`: DCEUNet enhanced feature, global-pooling regression head, bounded ROI refinement.
-- `WLS-HL`: DCEUNet bottle feature, column heatmap/confidence, weighted least-squares fit, bounded ROI refinement.
-- `DSAC-HL`: DCEUNet bottle feature, column heatmap/confidence, DSAC fit, bounded ROI refinement.
-- `TRiD-Horizon`: DCEUNet enhanced features over a frame sequence, ConvGRU, DSAC fit, bounded ROI refinement.
-
-## Structure
-
-```text
-config.py
-run_inference.py
-run_benchmark.py
-models/
-inference/
-weights/
-samples/
-outputs/
-tools/
-```
-
-## Checkpoints
-
-See `weights/checkpoint_manifest.csv`.
-
-| method | checkpoint | temporal | ROI |
-|---|---|---:|---:|
-| essld | `weights/essld_dceunetex.pth` | no | yes |
-| directreg | `weights/directreg_hl_best_full.pt` | no | yes |
-| wls | `weights/wls_hl_best_full.pt` | no | yes |
-| dsac | `weights/dsac_hl_best_full.pt` | no | yes |
-| trid | `weights/trid_horizon_best_visible_y95.pt` | yes | yes |
-
-At startup the scripts print checkpoint path, SHA256, device, precision, and input size. A missing or hash-mismatched checkpoint raises an error.
-
-## Coordinates
-
-Model input is always RGB `512 x 256`, float `[0,1]`, NCHW. Output CSV line endpoints are in original input-frame pixel coordinates:
-
-- `y_left`: line y at `x=0`
-- `y_right`: line y at `x=width-1`
-
-GT endpoints in `samples/test_manifest.csv` use the same original image coordinate convention.
-
-## Installation
-
-Desktop:
+## Run one method
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-# Install a PyTorch build matching your CUDA/CPU environment first.
-pip install -r requirements.txt
+python3 run_inference.py \
+    --method trid \
+    --input samples/TMD/TMD_annotated_15.avi \
+    --output outputs/TMD_annotated_15_trid.mp4 \
+    --device cuda \
+    --fp16
 ```
 
-Jetson:
+## Run all methods
 
 ```bash
-# Install the NVIDIA JetPack-compatible PyTorch wheel first.
-# Then install the remaining packages:
-pip3 install numpy opencv-python pandas
+python3 run_inference.py \
+    --method all \
+    --input samples/TMD/TMD_annotated_15.avi \
+    --output outputs/TMD_annotated_15_all_methods.mp4 \
+    --device cuda \
+    --fp16
 ```
 
-Do not install a generic PyPI PyTorch wheel on Jetson unless it matches your JetPack/CUDA stack.
-
-## Prepare Test Data
-
-The repo includes complete test manifests and annotation sidecars, not the large videos.
+## Smoke Test
 
 ```bash
-python3 tools/prepare_test_data.py --source-root /path/to/HL --symlink
+python3 run_inference.py \
+    --method all \
+    --input samples/TMD/TMD_annotated_15.avi \
+    --output outputs/smoke_test.mp4 \
+    --device cuda \
+    --fp16 \
+    --max-frames 20 \
+    --warmup 2
 ```
 
-Expected test set: 8 videos, 2196 frames.
-
-## Inference
-
-Single method on one video:
+## Run the complete test benchmark
 
 ```bash
-python3 run_inference.py --method trid --input samples/TMD/TMD_annotated_15.avi --output outputs/TMD_annotated_15_trid.mp4
+python3 run_benchmark.py \
+    --manifest samples/test_manifest.csv \
+    --device cuda \
+    --fp16 \
+    --output outputs/full_test_benchmark
 ```
 
-All methods in synchronized 2x3 panels:
+## Methods
 
-```bash
-python3 run_inference.py --method all --input samples/TMD/TMD_annotated_15.avi --output outputs/TMD_annotated_15_all_methods.mp4
-```
+- `essld`
+- `directreg`
+- `wls`
+- `dsac`
+- `trid`
+- `all`
 
-Single image:
+## Main arguments
 
-```bash
-python3 run_inference.py --method wls --input samples/example.png --output outputs/example_wls.mp4
-```
+- `--method`: method to run, or `all` for the synchronized 2x3 comparison video.
+- `--input`: image file, image folder, or video file.
+- `--output`: output video path; a CSV with the same stem is also written by default.
+- `--device`: `cuda`, `cpu`, or another PyTorch device string.
+- `--fp16`: use FP16 on CUDA.
+- `--no-fp16`: force FP32, including on CUDA.
+- `--no-roi`: disable ROI refinement and keep the coarse prediction.
+- `--no-roi-gate`: run ROI refinement without the conservative acceptance gate.
+- `--max-frames`: stop after this many frames.
+- `--warmup`: number of initial rows excluded from summary latency statistics.
+- `--verbose`: print per-frame CSV rows to the terminal.
 
-Folder of images:
+Defaults are CUDA if available, FP16 on CUDA, ROI refinement enabled, bounded ROI gate enabled, no GUI, and CSV saving when `--output` is provided.
 
-```bash
-python3 run_inference.py --method dsac --input samples/my_images --output outputs/my_images_dsac.mp4
-```
-
-Useful options:
-
-```bash
---device cuda
---fp16
---no-fp16
---no-roi
---no-roi-gate
---max-frames 100
---warmup 5
---verbose
-```
-
-Defaults: CUDA if available, FP16 on CUDA, bounded ROI gate enabled, CSV saved when `--output` is provided, no GUI.
-
-## Visualization Legend
+## Output colors
 
 - green: GT
-- yellow: coarse prediction before ROI
-- magenta: actual ROI search band
-- cyan: final accepted output after bounded ROI gate
+- yellow: coarse prediction
+- magenta: ROI search region
+- cyan: final accepted prediction
 
-If the gate rejects refinement, cyan overlaps yellow because the coarse line is retained.
+If the bounded gate rejects the ROI-refined line, the final cyan line coincides with the yellow coarse line.
 
-## Bounded ROI
+## Performance output
 
-Inference sequence:
+The terminal summary and CSV report:
 
-1. compute coarse line;
-2. compute existing ROI-refined line;
-3. evaluate gate;
-4. accept refined line or fall back to coarse.
+- model-only latency;
+- full-pipeline latency;
+- model FPS;
+- full-pipeline FPS;
+- throughput FPS;
+- center error;
+- endpoint error;
+- angular error;
+- ROI acceptance rate.
 
-The gate does not use GT. Thresholds live in `inference/roi_gate.py`.
+Model latency measures only neural-network forward time. Full-pipeline latency includes preprocessing, model forward, post-processing, and ROI refinement. Throughput FPS is measured from processed frames divided by elapsed wall time.
 
-The CSV logs gate accepted/rejected, reason, inside-ROI fraction, center correction, endpoint correction, angle correction, candidate count, and candidate span.
+## Outputs
 
-## TRiD Temporal State
-
-`TRiD-Horizon` resets temporal state at the beginning of every video. The inference runner keeps a rolling history up to `CLIP_LENGTH=8`; first frames use the available shorter prefix and do not use future frames. No hidden state is carried across videos.
-
-## Benchmark
-
-Run all methods on the prepared complete test manifest:
-
-```bash
-python3 run_benchmark.py --manifest samples/test_manifest.csv --device cuda --fp16 --output outputs/full_test_benchmark
-```
-
-Outputs:
-
-- `frame_level_results.csv`
-- `method_summary.csv`
-- `dataset_summary.csv`
-- `video_summary.csv`
-- `benchmark_environment.txt`
-- `failures.csv`
-
-Latency reporting separates model-only latency from full preprocessing + model + post-processing + ROI latency. CUDA model timing uses `torch.cuda.Event`; CPU timing uses `time.perf_counter()`.
-
-## CSV Fields
-
-Important fields include method, source, frame index, preprocessing/model/postprocess/ROI/full latency, model-only FPS, full-pipeline FPS, running throughput FPS, prediction-valid flag, ROI gate status/reason, coarse endpoints, existing refined endpoints, accepted final endpoints, GT endpoints when available, and center/endpoint/angular errors.
-
-## FP16
-
-`--fp16` is used only on CUDA. CPU inference remains FP32.
-
-## Known Limitations
-
-- TensorRT is not implemented here; it is future work.
-- Jetson FPS must be measured on the target Jetson. This README does not claim Jetson FPS.
-- The complete test videos are external to Git; use `tools/prepare_test_data.py`.
-- DSAC uses stochastic sampling inside the model head; run-to-run exact equality may require explicit PyTorch RNG seeding in a deployment wrapper.
+Generated videos and CSV files are written under `outputs/`. The repository keeps `outputs/.gitkeep` only; generated outputs are ignored by Git.
