@@ -6,6 +6,10 @@ IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 512
 CLIP_LENGTH = 8
 
+# ROI refinement is the main CPU cost on Jetson. The ROI is warped to this
+# width before edge/candidate processing and mapped back to original pixels.
+ROI_PROCESS_WIDTH = 512
+
 MEDIAN_FILTER_SIZES = [1, 5, 7]
 CANNY_FUSION_WEIGHTS = [0.5, 0.3, 0.2]
 CONFIDENCE_MAP_SIGMAS = [10, 15, 20]

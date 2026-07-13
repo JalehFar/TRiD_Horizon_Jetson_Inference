@@ -66,11 +66,53 @@ python3 run_benchmark.py \
 - `--no-fp16`: force FP32, including on CUDA.
 - `--no-roi`: disable ROI refinement and keep the coarse prediction.
 - `--no-roi-gate`: run ROI refinement without the conservative acceptance gate.
+- `--roi-width`: width used for CPU ROI refinement; lower is faster on Jetson.
+- `--roi-every`: run ROI refinement every N frames; skipped frames use the coarse line.
 - `--max-frames`: stop after this many frames.
 - `--warmup`: number of initial rows excluded from summary latency statistics.
 - `--verbose`: print per-frame CSV rows to the terminal.
 
 Defaults are CUDA if available, FP16 on CUDA, ROI refinement enabled, bounded ROI gate enabled, no GUI, and CSV saving when `--output` is provided.
+
+## Jetson speed options
+
+ROI refinement is CPU-heavy. The default path now runs ROI on a 512-wide normalized strip instead of the full source width, then maps the accepted line back to original pixels.
+
+For more speed, reduce the ROI width:
+
+```bash
+python3 run_inference.py \
+    --method trid \
+    --input samples/TMD/TMD_annotated_15.avi \
+    --output outputs/TMD_annotated_15_trid_fast_roi.mp4 \
+    --device cuda \
+    --fp16 \
+    --roi-width 256
+```
+
+For maximum speed, disable ROI refinement:
+
+```bash
+python3 run_inference.py \
+    --method trid \
+    --input samples/TMD/TMD_annotated_15.avi \
+    --output outputs/TMD_annotated_15_trid_no_roi.mp4 \
+    --device cuda \
+    --fp16 \
+    --no-roi
+```
+
+If ROI is still desired but not on every frame:
+
+```bash
+python3 run_inference.py \
+    --method trid \
+    --input samples/TMD/TMD_annotated_15.avi \
+    --output outputs/TMD_annotated_15_trid_roi_every_5.mp4 \
+    --device cuda \
+    --fp16 \
+    --roi-every 5
+```
 
 ## Output colors
 

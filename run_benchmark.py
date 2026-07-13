@@ -17,7 +17,7 @@ from inference.geometry import HorizonLine
 from inference.pipeline import MethodRunner
 
 
-def environment_text(device: torch.device, precision: str, warmup: int) -> str:
+def environment_text(device: torch.device, precision: str, warmup: int, roi: bool, roi_gate: bool, roi_width: int | None, roi_every: int) -> str:
     lines = [
         f"Python: {sys.version}",
         f"Platform: {platform.platform()}",
@@ -31,6 +31,10 @@ def environment_text(device: torch.device, precision: str, warmup: int) -> str:
         f"Precision: {precision}",
         f"Input dimensions: 512x256",
         f"Warmup frames: {warmup}",
+        f"ROI enabled: {roi}",
+        f"ROI gate enabled: {roi_gate}",
+        f"ROI processing width: {roi_width if roi_width is not None else 'default'}",
+        f"ROI every N frames: {roi_every}",
     ]
     try:
         lines.append("Git commit: " + subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip())
@@ -52,12 +56,16 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("outputs/full_test_benchmark"))
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--roi", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--roi-gate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--roi-width", type=int, default=None)
+    parser.add_argument("--roi-every", type=int, default=1)
     args = parser.parse_args()
 
     args.output.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     precision = "fp16" if args.fp16 and device.type == "cuda" else "fp32"
-    (args.output / "benchmark_environment.txt").write_text(environment_text(device, precision, args.warmup))
+    (args.output / "benchmark_environment.txt").write_text(environment_text(device, precision, args.warmup, args.roi, args.roi_gate, args.roi_width, args.roi_every))
     with args.manifest.open() as f:
         manifest_rows = list(csv.DictReader(f))
     by_video: dict[str, list[dict]] = {}
@@ -67,7 +75,7 @@ def main() -> int:
     failures = []
     all_rows = []
     for method in METHODS:
-        runner = MethodRunner(method, device, args.fp16, roi=True, roi_gate=True)
+        runner = MethodRunner(method, device, args.fp16, args.roi, args.roi_gate, args.roi_width, args.roi_every)
         for rel_path, rows in by_video.items():
             path = Path(rel_path)
             runner.reset()

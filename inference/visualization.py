@@ -3,7 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from inference.geometry import HorizonLine, draw_line
+from inference.geometry import HorizonLine, draw_line, is_valid_line
 
 GREEN = (0, 220, 0)
 YELLOW = (0, 255, 255)
@@ -14,7 +14,7 @@ BLACK = (0, 0, 0)
 
 
 def draw_roi(frame: np.ndarray, pts: np.ndarray | None, thickness: int = 2) -> None:
-    if pts is not None:
+    if pts is not None and np.isfinite(pts).all():
         cv2.polylines(frame, [np.round(pts).astype(np.int32)], True, MAGENTA, thickness, cv2.LINE_AA)
 
 
@@ -33,12 +33,12 @@ def status_box(frame: np.ndarray, lines: list[str]) -> None:
 def render_method_panel(frame: np.ndarray, result, latency_fps: float) -> np.ndarray:
     out = frame.copy()
     thickness = max(2, int(round(frame.shape[1] / 900.0)))
-    if result.gt is not None:
+    if is_valid_line(result.gt):
         out = draw_line(out, result.gt, GREEN, thickness)
     draw_roi(out, result.roi_pts, thickness)
-    if result.coarse is not None:
+    if is_valid_line(result.coarse):
         out = draw_line(out, result.coarse, YELLOW, thickness)
-    if result.final is not None:
+    if is_valid_line(result.final):
         out = draw_line(out, result.final, CYAN, thickness)
     status = "valid" if result.prediction_valid else "invalid"
     roi = "accepted" if result.roi_accepted else f"rejected:{result.roi_reason}"
@@ -48,7 +48,7 @@ def render_method_panel(frame: np.ndarray, result, latency_fps: float) -> np.nda
 
 def render_original_panel(frame: np.ndarray, gt: HorizonLine | None, frame_index: int) -> np.ndarray:
     out = frame.copy()
-    if gt is not None:
+    if is_valid_line(gt):
         out = draw_line(out, gt, GREEN, max(2, int(round(frame.shape[1] / 900.0))))
     status_box(out, ["Original + GT" if gt is not None else "Original", f"frame {frame_index}"])
     return out

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from config import DISPLAY_NAMES
-from inference.geometry import HorizonLine
+from inference.geometry import HorizonLine, is_valid_line
 from inference.pipeline import MethodRunner
 from inference.visualization import make_all_methods_montage, render_method_panel
 
@@ -65,7 +65,7 @@ def load_manifest_gt(manifest_path: Path, input_path: Path) -> dict[int, Horizon
 def result_row(source: str, result, gt: HorizonLine | None, running_fps: float) -> dict:
     err = result.errors()
     def endpoints(line):
-        return (np.nan, np.nan) if line is None else (line.y_left, line.y_right)
+        return (np.nan, np.nan) if not is_valid_line(line) else (line.y_left, line.y_right)
     c_l, c_r = endpoints(result.coarse)
     e_l, e_r = endpoints(result.existing_refined)
     f_l, f_r = endpoints(result.final)
@@ -132,6 +132,8 @@ def main() -> int:
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--roi", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--roi-gate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--roi-width", type=int, default=None, help="Width used for CPU ROI refinement; lower values are faster on Jetson.")
+    parser.add_argument("--roi-every", type=int, default=1, help="Run ROI refinement every N frames; skipped frames use the coarse line.")
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-csv", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--show", action="store_true")
@@ -144,7 +146,7 @@ def main() -> int:
     device = choose_device(args.device)
     fp16 = (device.type == "cuda") if args.fp16 is None else args.fp16
     methods = METHODS if args.method == "all" else [args.method]
-    runners = [MethodRunner(m, device, fp16, args.roi, args.roi_gate) for m in methods]
+    runners = [MethodRunner(m, device, fp16, args.roi, args.roi_gate, args.roi_width, args.roi_every) for m in methods]
     kind, source = open_input(args.input)
     gt_by_frame = load_manifest_gt(args.manifest, args.input)
     if gt_by_frame:

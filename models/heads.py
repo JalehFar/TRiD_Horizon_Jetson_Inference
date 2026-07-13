@@ -54,6 +54,9 @@ def endpoints_from_mb(m: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def weighted_line_fit(x: torch.Tensor, y: torch.Tensor, weights: torch.Tensor, ridge: float = 1e-3) -> tuple[torch.Tensor, torch.Tensor]:
+    x = x.float()
+    y = y.float()
+    weights = weights.float()
     if x.ndim == 1:
         x = x.unsqueeze(0).expand_as(y)
     w = weights.clamp_min(1e-6)
@@ -68,6 +71,8 @@ def weighted_line_fit(x: torch.Tensor, y: torch.Tensor, weights: torch.Tensor, r
 
 
 def heatmap_to_points(logits: torch.Tensor, confidence_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    logits = logits.float()
+    confidence_logits = confidence_logits.float()
     bsz, _, height, width = logits.shape
     probs = torch.softmax(logits.squeeze(1), dim=1)
     y_grid = torch.linspace(-1.0, 1.0, height, device=logits.device, dtype=logits.dtype).view(1, height, 1)
@@ -88,6 +93,9 @@ class DSACLineFit(nn.Module):
         self.min_column_delta = float(min_column_delta)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, confidence: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = x.float()
+        y = y.float()
+        confidence = confidence.float()
         bsz, width = x.shape
         probs = confidence.clamp_min(1e-6)
         probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)

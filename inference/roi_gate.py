@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from inference.geometry import HorizonLine
+from inference.geometry import HorizonLine, is_valid_line
 from inference.postprocess import refine_existing
 
 
@@ -34,19 +34,25 @@ def roi_top_bottom(roi_pts: np.ndarray, xs: np.ndarray):
 
 
 def inside_fraction(line: HorizonLine, roi_pts: np.ndarray, samples: int = 128) -> float:
+    if not is_valid_line(line) or roi_pts is None or not np.isfinite(roi_pts).all():
+        return 0.0
     xs = np.linspace(0, line.width - 1, samples)
     top, bottom = roi_top_bottom(roi_pts, xs)
     ys = line_y(line, xs)
     return float(np.mean((ys >= top) & (ys <= bottom)))
 
 
-def apply_bounded_roi(frame, coarse: HorizonLine, enable_roi: bool = True, enable_gate: bool = True, cfg: ROIGateConfig = DEFAULT_GATE):
+def apply_bounded_roi(frame, coarse: HorizonLine, enable_roi: bool = True, enable_gate: bool = True, cfg: ROIGateConfig = DEFAULT_GATE, roi_width: int | None = None):
     if not enable_roi:
         return {"existing_refined": None, "final": coarse, "accepted": False, "reason": "roi_disabled", "roi_pts": None, "padding": None, "roi_height": None, "inside_roi_fraction": np.nan, "center_correction": np.nan, "endpoint_correction": np.nan, "angle_correction": np.nan, "candidate_count": 0, "candidate_span": 0.0}
-    refined, roi_pts, padding, roi_h, _, points = refine_existing(frame, coarse)
+    refined, roi_pts, padding, roi_h, binary, points = refine_existing(frame, coarse, roi_width=roi_width)
     candidate_count = 0 if points is None else int(len(points))
-    candidate_span = 0.0 if points is None or len(points) == 0 else float(points[:, 1].max() - points[:, 1].min())
-    if refined is None:
+    if points is None or len(points) == 0 or binary is None or binary.shape[1] <= 1:
+        candidate_span = 0.0
+    else:
+        roi_span = float(points[:, 1].max() - points[:, 1].min())
+        candidate_span = roi_span * float(coarse.width - 1) / float(binary.shape[1] - 1)
+    if not is_valid_line(refined):
         return {"existing_refined": None, "final": coarse, "accepted": False, "reason": "invalid_refined_fit", "roi_pts": roi_pts, "padding": padding, "roi_height": roi_h, "inside_roi_fraction": 0.0, "center_correction": np.nan, "endpoint_correction": np.nan, "angle_correction": np.nan, "candidate_count": candidate_count, "candidate_span": candidate_span}
     inside = inside_fraction(refined, roi_pts)
     center_corr = abs(refined.y_center - coarse.y_center)

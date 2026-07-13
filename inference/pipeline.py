@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 import config
-from inference.geometry import HorizonLine, line_errors, line_from_center_angle
+from inference.geometry import HorizonLine, is_valid_line, line_errors, line_from_center_angle
 from inference.postprocess import get_coarse_line_from_mask
 from inference.roi_gate import apply_bounded_roi
 from models.dceunet import DCEUNet
@@ -40,6 +40,13 @@ def endpoints_norm_to_original(endpoints, width: int, height: int) -> HorizonLin
     return HorizonLine(float(endpoints[0]) * float(height - 1), float(endpoints[1]) * float(height - 1), width, height)
 
 
+def invalid_result(method: str, frame_index: int, timings: dict[str, float], gt: HorizonLine | None, reason: str) -> "FrameResult":
+    timings.setdefault("postprocess_ms", 0.0)
+    timings.setdefault("roi_ms", 0.0)
+    timings["full_ms"] = timings.get("preprocess_ms", 0.0) + timings.get("model_ms", 0.0) + timings.get("postprocess_ms", 0.0) + timings.get("roi_ms", 0.0)
+    return FrameResult(config.DISPLAY_NAMES[method], frame_index, None, None, None, False, False, reason, None, timings, {}, gt)
+
+
 @dataclass
 class FrameResult:
     method: str
@@ -62,12 +69,23 @@ class FrameResult:
 
 
 class MethodRunner:
-    def __init__(self, method: str, device: torch.device, fp16: bool = True, roi: bool = True, roi_gate: bool = True):
+    def __init__(
+        self,
+        method: str,
+        device: torch.device,
+        fp16: bool = True,
+        roi: bool = True,
+        roi_gate: bool = True,
+        roi_width: int | None = None,
+        roi_every: int = 1,
+    ):
         self.method = method
         self.device = device
         self.fp16 = bool(fp16 and device.type == "cuda")
         self.roi = roi
         self.roi_gate = roi_gate
+        self.roi_width = int(roi_width or config.ROI_PROCESS_WIDTH)
+        self.roi_every = max(1, int(roi_every))
         self.model = self._load_model()
         self.model.eval()
         if self.fp16:
@@ -146,14 +164,22 @@ class MethodRunner:
         else:
             timings["model_ms"] = (time.perf_counter() - model_start_wall) * 1000.0
         t_post = time.perf_counter()
-        if coarse is None:
+        if not is_valid_line(coarse):
             timings["postprocess_ms"] = (time.perf_counter() - t_post) * 1000.0
-            timings["roi_ms"] = 0.0
-            timings["full_ms"] = timings["preprocess_ms"] + timings["model_ms"] + timings["postprocess_ms"]
-            return FrameResult(config.DISPLAY_NAMES[self.method], frame_index, None, None, None, False, False, "No valid prediction", None, timings, {}, gt)
+            reason = "nonfinite_or_missing_coarse_line"
+            return invalid_result(self.method, frame_index, timings, gt, reason)
         timings["postprocess_ms"] = (time.perf_counter() - t_post) * 1000.0
         t_roi = time.perf_counter()
-        roi_log = apply_bounded_roi(frame_bgr, coarse, self.roi, self.roi_gate)
+        run_roi = self.roi and ((frame_index - 1) % self.roi_every == 0)
+        roi_log = apply_bounded_roi(frame_bgr, coarse, run_roi, self.roi_gate, roi_width=self.roi_width)
+        if self.roi and not run_roi:
+            roi_log["reason"] = f"roi_skipped_every_{self.roi_every}"
         timings["roi_ms"] = (time.perf_counter() - t_roi) * 1000.0
         timings["full_ms"] = timings["preprocess_ms"] + timings["model_ms"] + timings["postprocess_ms"] + timings["roi_ms"]
-        return FrameResult(config.DISPLAY_NAMES[self.method], frame_index, coarse, roi_log["existing_refined"], roi_log["final"], True, bool(roi_log["accepted"]), roi_log["reason"], roi_log["roi_pts"], timings, roi_log, gt)
+        final = roi_log.get("final")
+        if not is_valid_line(final):
+            roi_log["final"] = coarse
+            roi_log["accepted"] = False
+            roi_log["reason"] = "nonfinite_final_fallback_to_coarse"
+            final = coarse
+        return FrameResult(config.DISPLAY_NAMES[self.method], frame_index, coarse, roi_log["existing_refined"], final, True, bool(roi_log["accepted"]), roi_log["reason"], roi_log["roi_pts"], timings, roi_log, gt)

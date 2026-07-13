@@ -54,24 +54,26 @@ def get_coarse_line_from_mask(mask: np.ndarray, original_frame: np.ndarray):
 
 
 def non_max_suppression(magnitude: np.ndarray, angle: np.ndarray) -> np.ndarray:
-    h, w = magnitude.shape
-    out = np.zeros_like(magnitude)
-    deg = angle * 180.0 / np.pi
-    deg[deg < 0] += 180
-    for i in range(1, h - 1):
-        for j in range(1, w - 1):
-            a = deg[i, j]
-            q = r = 255.0
-            if (0 <= a < 22.5) or (157.5 <= a <= 180):
-                q, r = magnitude[i, j + 1], magnitude[i, j - 1]
-            elif 22.5 <= a < 67.5:
-                q, r = magnitude[i + 1, j - 1], magnitude[i - 1, j + 1]
-            elif 67.5 <= a < 112.5:
-                q, r = magnitude[i + 1, j], magnitude[i - 1, j]
-            elif 112.5 <= a < 157.5:
-                q, r = magnitude[i - 1, j - 1], magnitude[i + 1, j + 1]
-            if magnitude[i, j] >= q and magnitude[i, j] >= r:
-                out[i, j] = magnitude[i, j]
+    """Vectorized non-maximum suppression for the thin ROI confidence map."""
+
+    mag = magnitude.astype(np.float32, copy=False)
+    deg = np.rad2deg(angle).astype(np.float32, copy=False)
+    deg[deg < 0] += 180.0
+
+    padded = np.pad(mag, 1, mode="constant")
+    center = padded[1:-1, 1:-1]
+    east, west = padded[1:-1, 2:], padded[1:-1, :-2]
+    south, north = padded[2:, 1:-1], padded[:-2, 1:-1]
+    sw, ne = padded[2:, :-2], padded[:-2, 2:]
+    nw, se = padded[:-2, :-2], padded[2:, 2:]
+
+    out = np.zeros_like(mag, dtype=np.float32)
+    mask0 = ((deg < 22.5) | (deg >= 157.5)) & (center >= east) & (center >= west)
+    mask45 = (deg >= 22.5) & (deg < 67.5) & (center >= sw) & (center >= ne)
+    mask90 = (deg >= 67.5) & (deg < 112.5) & (center >= south) & (center >= north)
+    mask135 = (deg >= 112.5) & (deg < 157.5) & (center >= nw) & (center >= se)
+    keep = mask0 | mask45 | mask90 | mask135
+    out[keep] = center[keep]
     return out
 
 
@@ -79,7 +81,7 @@ def calculate_dynamic_padding(grad_score: float = 80) -> int:
     return int(40 - np.clip((grad_score - 25.0) / (200.0 - 25.0), 0, 1) * 20)
 
 
-def create_roi(frame: np.ndarray, coarse: HorizonLine, padding: int):
+def create_roi(frame: np.ndarray, coarse: HorizonLine, padding: int, target_width: int | None = None):
     h, w = frame.shape[:2]
     angle = np.deg2rad(np.clip(coarse.theta_deg, -89.9, 89.9))
     slope = np.tan(angle)
@@ -87,10 +89,12 @@ def create_roi(frame: np.ndarray, coarse: HorizonLine, padding: int):
     y_pad = padding / (abs(np.cos(angle)) + 1e-6)
     src = np.float32([[0, intercept - y_pad], [w - 1, slope * (w - 1) + intercept - y_pad], [w - 1, slope * (w - 1) + intercept + y_pad], [0, intercept + y_pad]])
     roi_h = int(2 * padding)
-    dst = np.float32([[0, 0], [w - 1, 0], [w - 1, roi_h - 1], [0, roi_h - 1]])
+    roi_w = int(target_width or w)
+    roi_w = max(32, min(roi_w, w))
+    dst = np.float32([[0, 0], [roi_w - 1, 0], [roi_w - 1, roi_h - 1], [0, roi_h - 1]])
     m = cv2.getPerspectiveTransform(src, dst)
     m_inv = cv2.getPerspectiveTransform(dst, src)
-    return cv2.warpPerspective(frame, m, (w, roi_h)), m_inv, src, roi_h
+    return cv2.warpPerspective(frame, m, (roi_w, roi_h)), m_inv, src, roi_h
 
 
 def dual_fusion_pipeline(roi_image: np.ndarray):
@@ -137,13 +141,27 @@ def dual_fusion_pipeline(roi_image: np.ndarray):
     return (float(k * (w / 2) + b), float(np.rad2deg(np.arctan(k)))), binary, pts_yx
 
 
-def refine_existing(frame: np.ndarray, coarse: HorizonLine):
+def refine_existing(frame: np.ndarray, coarse: HorizonLine, roi_width: int | None = None):
     padding = calculate_dynamic_padding(80)
-    roi, m_inv, roi_pts, roi_h = create_roi(frame, coarse, padding)
+    roi, m_inv, roi_pts, roi_h = create_roi(frame, coarse, padding, target_width=roi_width or config.ROI_PROCESS_WIDTH)
     local, binary, points = dual_fusion_pipeline(roi)
     if local is None:
         return None, roi_pts, padding, roi_h, binary, points
     local_y, local_angle = local
-    global_y = cv2.perspectiveTransform(np.array([[[roi.shape[1] / 2, local_y]]], dtype=np.float32), m_inv)[0][0][1]
-    refined = line_from_center_angle(float(global_y), coarse.theta_deg + float(local_angle), coarse.width, coarse.height)
+    local_slope = float(np.tan(np.deg2rad(local_angle)))
+    local_intercept = float(local_y) - local_slope * (float(roi.shape[1]) / 2.0)
+    local_pts = np.array(
+        [
+            [[0.0, local_intercept]],
+            [[float(roi.shape[1] - 1), local_slope * float(roi.shape[1] - 1) + local_intercept]],
+        ],
+        dtype=np.float32,
+    )
+    global_pts = cv2.perspectiveTransform(local_pts, m_inv).reshape(2, 2)
+    dx = float(global_pts[1, 0] - global_pts[0, 0])
+    if abs(dx) < 1e-6:
+        return None, roi_pts, padding, roi_h, binary, points
+    slope = float((global_pts[1, 1] - global_pts[0, 1]) / dx)
+    intercept = float(global_pts[0, 1] - slope * global_pts[0, 0])
+    refined = HorizonLine(intercept, slope * float(coarse.width - 1) + intercept, coarse.width, coarse.height)
     return refined, roi_pts, padding, roi_h, binary, points
