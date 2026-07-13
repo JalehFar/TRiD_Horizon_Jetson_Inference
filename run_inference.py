@@ -105,22 +105,34 @@ def result_row(source: str, result, gt: HorizonLine | None, running_fps: float) 
     }
 
 
-def summarize(rows: list[dict], method: str, device: torch.device, precision: str, warmup: int) -> None:
+def _summarize_block(rows: list[dict], label: str, warmup: int) -> None:
     timed = rows[warmup:] if len(rows) > warmup else rows
+    print(f"\n{label}")
+    print(f"frames={len(rows)} valid={sum(r['prediction_valid'] for r in rows)} warmup={warmup}")
+    if not len(timed):
+        return
     model = np.array([r["model_forward_ms"] for r in timed], dtype=float)
     full = np.array([r["full_pipeline_ms"] for r in timed], dtype=float)
     center = np.array([r["center_y_abs_error"] for r in timed], dtype=float)
     endpoint = np.array([r["mean_endpoint_abs_error"] for r in timed], dtype=float)
     angle = np.array([r["angular_error"] for r in timed], dtype=float)
+    print(f"model latency ms mean/median/p95: {np.nanmean(model):.3f} / {np.nanmedian(model):.3f} / {np.nanpercentile(model,95):.3f}")
+    print(f"full latency ms mean/median/p95: {np.nanmean(full):.3f} / {np.nanmedian(full):.3f} / {np.nanpercentile(full,95):.3f}")
+    print(f"latency-derived FPS model/full: {1000/np.nanmean(model):.2f} / {1000/np.nanmean(full):.2f}")
+    print(f"center error mean/median/p95: {np.nanmean(center):.3f} / {np.nanmedian(center):.3f} / {np.nanpercentile(center,95):.3f}")
+    print(f"endpoint mean error: {np.nanmean(endpoint):.3f}; angular mean error: {np.nanmean(angle):.3f}")
+    print(f"ROI acceptance rate: {100*np.mean([r['roi_accepted'] for r in timed]):.2f}%")
+
+
+def summarize(rows: list[dict], method: str, device: torch.device, precision: str, warmup: int) -> None:
     print("\nSummary")
     print(f"method={method} device={device} precision={precision} frames={len(rows)} valid={sum(r['prediction_valid'] for r in rows)} warmup={warmup}")
-    if len(timed):
-        print(f"model latency ms mean/median/p95: {np.nanmean(model):.3f} / {np.nanmedian(model):.3f} / {np.nanpercentile(model,95):.3f}")
-        print(f"full latency ms mean/median/p95: {np.nanmean(full):.3f} / {np.nanmedian(full):.3f} / {np.nanpercentile(full,95):.3f}")
-        print(f"latency-derived FPS model/full: {1000/np.nanmean(model):.2f} / {1000/np.nanmean(full):.2f}")
-        print(f"center error mean/median/p95: {np.nanmean(center):.3f} / {np.nanmedian(center):.3f} / {np.nanpercentile(center,95):.3f}")
-        print(f"endpoint mean error: {np.nanmean(endpoint):.3f}; angular mean error: {np.nanmean(angle):.3f}")
-        print(f"ROI acceptance rate: {100*np.mean([r['roi_accepted'] for r in timed]):.2f}%")
+    if method == "all":
+        for method_name in sorted({r["method"] for r in rows}):
+            _summarize_block([r for r in rows if r["method"] == method_name], f"Profile: {method_name}", warmup)
+        _summarize_block(rows, "Overall all-method row profile", warmup)
+    else:
+        _summarize_block(rows, f"Profile: {method}", warmup)
 
 
 def main() -> int:
