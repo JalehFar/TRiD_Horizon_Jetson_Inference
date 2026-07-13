@@ -11,7 +11,7 @@ import torch
 
 import config
 from inference.geometry import HorizonLine, is_valid_line, line_errors, line_from_center_angle
-from inference.postprocess import get_coarse_line_from_mask
+from inference.postprocess import get_coarse_line_from_mask, refine_essld_original
 from inference.roi_gate import apply_bounded_roi
 from models.dceunet import DCEUNet
 from models.heads import DirectRegHL, DSACHL, TRiDHorizon, WLSHL, heatmap_to_points
@@ -173,6 +173,59 @@ class MethodRunner:
             final = coarse
         return FrameResult(config.DISPLAY_NAMES[self.method], frame_index, coarse, roi_log["existing_refined"], final, True, bool(roi_log["accepted"]), roi_log["reason"], roi_log["roi_pts"], timings, roi_log, gt)
 
+    def _finish_essld_from_coarse(
+        self,
+        frame_bgr: np.ndarray,
+        frame_index: int,
+        gt: HorizonLine | None,
+        coarse: HorizonLine | None,
+        timings: dict[str, float],
+    ) -> FrameResult:
+        t_post = time.perf_counter()
+        if not is_valid_line(coarse):
+            timings["postprocess_ms"] = (time.perf_counter() - t_post) * 1000.0
+            return invalid_result(self.method, frame_index, timings, gt, "nonfinite_or_missing_coarse_line")
+        timings["postprocess_ms"] = (time.perf_counter() - t_post) * 1000.0
+        t_roi = time.perf_counter()
+        if self.roi:
+            refined, roi_pts, padding, roi_height = refine_essld_original(frame_bgr, coarse)
+            if is_valid_line(refined):
+                final = refined
+                existing_refined = refined
+                accepted = True
+                reason = "roi_refined"
+            else:
+                final = coarse
+                existing_refined = None
+                accepted = False
+                reason = "roi_failed_fallback_to_coarse"
+        else:
+            final = coarse
+            existing_refined = None
+            roi_pts = None
+            padding = None
+            roi_height = None
+            accepted = False
+            reason = "roi_disabled"
+        timings["roi_ms"] = (time.perf_counter() - t_roi) * 1000.0
+        timings["full_ms"] = timings["preprocess_ms"] + timings.get("h2d_ms", 0.0) + timings["model_ms"] + timings["postprocess_ms"] + timings["roi_ms"]
+        roi_log = {
+            "existing_refined": existing_refined,
+            "final": final,
+            "accepted": accepted,
+            "reason": reason,
+            "roi_pts": roi_pts,
+            "padding": padding,
+            "roi_height": roi_height,
+            "inside_roi_fraction": np.nan,
+            "center_correction": np.nan if existing_refined is None else abs(existing_refined.y_center - coarse.y_center),
+            "endpoint_correction": np.nan if existing_refined is None else max(abs(existing_refined.y_left - coarse.y_left), abs(existing_refined.y_right - coarse.y_right)),
+            "angle_correction": np.nan if existing_refined is None else abs(existing_refined.theta_deg - coarse.theta_deg),
+            "candidate_count": np.nan,
+            "candidate_span": np.nan,
+        }
+        return FrameResult(config.DISPLAY_NAMES[self.method], frame_index, coarse, existing_refined, final, True, accepted, reason, roi_pts, timings, roi_log, gt)
+
     @torch.no_grad()
     def predict(self, frame_bgr: np.ndarray, frame_index: int, gt: HorizonLine | None = None) -> FrameResult:
         timings = {}
@@ -197,6 +250,11 @@ class MethodRunner:
             mask = (prob_orig > 0.5).astype(np.uint8) * 255
             coarse_tuple = get_coarse_line_from_mask(mask, frame_bgr)
             coarse = None if coarse_tuple is None else line_from_center_angle(coarse_tuple[0], coarse_tuple[1], frame_bgr.shape[1], frame_bgr.shape[0])
+            if self.device.type == "cuda":
+                timings["model_ms"] = cuda_time_ms(ev0, ev1)
+            else:
+                timings["model_ms"] = (time.perf_counter() - model_start_wall) * 1000.0
+            return self._finish_essld_from_coarse(frame_bgr, frame_index, gt, coarse, timings)
         elif self.method == "trid":
             if self.trid_mode == "streaming":
                 coarse, stream_timings, stream_extra = self.forward_stream_step(x, frame_bgr.shape[1], frame_bgr.shape[0])
