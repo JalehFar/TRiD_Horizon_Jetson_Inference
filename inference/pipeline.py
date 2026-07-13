@@ -78,6 +78,7 @@ class MethodRunner:
         roi_gate: bool = True,
         roi_width: int | None = None,
         roi_every: int = 1,
+        trid_mode: str = "chunk",
     ):
         self.method = method
         self.device = device
@@ -86,13 +87,15 @@ class MethodRunner:
         self.roi_gate = roi_gate
         self.roi_width = int(roi_width or config.ROI_PROCESS_WIDTH)
         self.roi_every = max(1, int(roi_every))
+        self.trid_mode = trid_mode
         self.model = self._load_model()
         self.model.eval()
         if self.fp16:
             self.model.half()
         self.clip_buffer: list[torch.Tensor] = []
         meta = config.CHECKPOINTS[method]
-        print(f"method={method} checkpoint={meta['path']} sha256={sha256_file(meta['path'])} device={device} precision={'fp16' if self.fp16 else 'fp32'} input={config.IMAGE_WIDTH}x{config.IMAGE_HEIGHT}")
+        extra = f" trid_mode={self.trid_mode}" if method == "trid" else ""
+        print(f"method={method} checkpoint={meta['path']} sha256={sha256_file(meta['path'])} device={device} precision={'fp16' if self.fp16 else 'fp32'} input={config.IMAGE_WIDTH}x{config.IMAGE_HEIGHT}{extra}")
 
     def reset(self) -> None:
         self.clip_buffer = []
@@ -118,6 +121,38 @@ class MethodRunner:
                 raise RuntimeError(f"Incompatible checkpoint {path}: missing={missing}, unexpected={unexpected}")
         return model.to(self.device)
 
+    def _finish_from_coarse(
+        self,
+        frame_bgr: np.ndarray,
+        frame_index: int,
+        gt: HorizonLine | None,
+        coarse: HorizonLine | None,
+        timings: dict[str, float],
+        roi_log_extra: dict | None = None,
+    ) -> FrameResult:
+        t_post = time.perf_counter()
+        if not is_valid_line(coarse):
+            timings["postprocess_ms"] = (time.perf_counter() - t_post) * 1000.0
+            reason = "nonfinite_or_missing_coarse_line"
+            return invalid_result(self.method, frame_index, timings, gt, reason)
+        timings["postprocess_ms"] = (time.perf_counter() - t_post) * 1000.0
+        t_roi = time.perf_counter()
+        run_roi = self.roi and ((frame_index - 1) % self.roi_every == 0)
+        roi_log = apply_bounded_roi(frame_bgr, coarse, run_roi, self.roi_gate, roi_width=self.roi_width)
+        if roi_log_extra:
+            roi_log.update(roi_log_extra)
+        if self.roi and not run_roi:
+            roi_log["reason"] = f"roi_skipped_every_{self.roi_every}"
+        timings["roi_ms"] = (time.perf_counter() - t_roi) * 1000.0
+        timings["full_ms"] = timings["preprocess_ms"] + timings["model_ms"] + timings["postprocess_ms"] + timings["roi_ms"]
+        final = roi_log.get("final")
+        if not is_valid_line(final):
+            roi_log["final"] = coarse
+            roi_log["accepted"] = False
+            roi_log["reason"] = "nonfinite_final_fallback_to_coarse"
+            final = coarse
+        return FrameResult(config.DISPLAY_NAMES[self.method], frame_index, coarse, roi_log["existing_refined"], final, True, bool(roi_log["accepted"]), roi_log["reason"], roi_log["roi_pts"], timings, roi_log, gt)
+
     @torch.no_grad()
     def predict(self, frame_bgr: np.ndarray, frame_index: int, gt: HorizonLine | None = None) -> FrameResult:
         timings = {}
@@ -142,10 +177,14 @@ class MethodRunner:
             coarse_tuple = get_coarse_line_from_mask(mask, frame_bgr)
             coarse = None if coarse_tuple is None else line_from_center_angle(coarse_tuple[0], coarse_tuple[1], frame_bgr.shape[1], frame_bgr.shape[0])
         elif self.method == "trid":
-            self.clip_buffer.append(x[0].detach().cpu())
-            if len(self.clip_buffer) > config.CLIP_LENGTH:
-                self.clip_buffer = self.clip_buffer[-config.CLIP_LENGTH :]
-            seq = torch.stack(self.clip_buffer, dim=0).unsqueeze(0).to(self.device)
+            if self.trid_mode == "single":
+                seq_cpu = [x[0].detach().cpu()]
+            else:
+                self.clip_buffer.append(x[0].detach().cpu())
+                if len(self.clip_buffer) > config.CLIP_LENGTH:
+                    self.clip_buffer = self.clip_buffer[-config.CLIP_LENGTH :]
+                seq_cpu = self.clip_buffer
+            seq = torch.stack(seq_cpu, dim=0).unsqueeze(0).to(self.device)
             if self.fp16:
                 seq = seq.half()
             out = self.model(seq)
@@ -163,23 +202,56 @@ class MethodRunner:
             timings["model_ms"] = cuda_time_ms(ev0, ev1)
         else:
             timings["model_ms"] = (time.perf_counter() - model_start_wall) * 1000.0
-        t_post = time.perf_counter()
-        if not is_valid_line(coarse):
-            timings["postprocess_ms"] = (time.perf_counter() - t_post) * 1000.0
-            reason = "nonfinite_or_missing_coarse_line"
-            return invalid_result(self.method, frame_index, timings, gt, reason)
-        timings["postprocess_ms"] = (time.perf_counter() - t_post) * 1000.0
-        t_roi = time.perf_counter()
-        run_roi = self.roi and ((frame_index - 1) % self.roi_every == 0)
-        roi_log = apply_bounded_roi(frame_bgr, coarse, run_roi, self.roi_gate, roi_width=self.roi_width)
-        if self.roi and not run_roi:
-            roi_log["reason"] = f"roi_skipped_every_{self.roi_every}"
-        timings["roi_ms"] = (time.perf_counter() - t_roi) * 1000.0
-        timings["full_ms"] = timings["preprocess_ms"] + timings["model_ms"] + timings["postprocess_ms"] + timings["roi_ms"]
-        final = roi_log.get("final")
-        if not is_valid_line(final):
-            roi_log["final"] = coarse
-            roi_log["accepted"] = False
-            roi_log["reason"] = "nonfinite_final_fallback_to_coarse"
-            final = coarse
-        return FrameResult(config.DISPLAY_NAMES[self.method], frame_index, coarse, roi_log["existing_refined"], final, True, bool(roi_log["accepted"]), roi_log["reason"], roi_log["roi_pts"], timings, roi_log, gt)
+        return self._finish_from_coarse(frame_bgr, frame_index, gt, coarse, timings)
+
+    @torch.no_grad()
+    def predict_trid_chunk(self, items: list[tuple[int, np.ndarray, HorizonLine | None]]) -> list[FrameResult]:
+        if self.method != "trid":
+            raise RuntimeError("predict_trid_chunk is only valid for TRiD-Horizon")
+        if not items:
+            return []
+
+        frame_indices = [item[0] for item in items]
+        frames = [item[1] for item in items]
+        gts = [item[2] for item in items]
+        actual_count = len(items)
+
+        t0 = time.perf_counter()
+        tensors = [preprocess(frame)[0] for frame in frames]
+        while len(tensors) < config.CLIP_LENGTH:
+            tensors.append(tensors[-1].clone())
+        seq_cpu = torch.stack(tensors[: config.CLIP_LENGTH], dim=0)
+        preprocess_ms_total = (time.perf_counter() - t0) * 1000.0
+
+        seq = seq_cpu.unsqueeze(0).to(self.device)
+        if self.fp16:
+            seq = seq.half()
+        model_start_wall = time.perf_counter()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+            ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            ev0.record()
+        out = self.model(seq)
+        if self.device.type == "cuda":
+            ev1.record()
+            model_ms_total = cuda_time_ms(ev0, ev1)
+        else:
+            model_ms_total = (time.perf_counter() - model_start_wall) * 1000.0
+
+        endpoints_all = out["endpoints_norm01"][0, :actual_count].float().cpu().numpy()
+        results: list[FrameResult] = []
+        preprocess_each = preprocess_ms_total / float(actual_count)
+        model_each = model_ms_total / float(config.CLIP_LENGTH)
+        for local_i, (frame_index, frame, gt, endpoints) in enumerate(zip(frame_indices, frames, gts, endpoints_all)):
+            timings = {"preprocess_ms": preprocess_each, "model_ms": model_each}
+            coarse = endpoints_norm_to_original(endpoints, frame.shape[1], frame.shape[0])
+            extra = {
+                "trid_mode": "chunk",
+                "trid_chunk_length": config.CLIP_LENGTH,
+                "trid_chunk_position": local_i,
+                "trid_actual_chunk_frames": actual_count,
+                "trid_backbone_evals_total": config.CLIP_LENGTH,
+                "trid_backbone_evals_amortized": 1.0,
+            }
+            results.append(self._finish_from_coarse(frame, frame_index, gt, coarse, timings, extra))
+        return results

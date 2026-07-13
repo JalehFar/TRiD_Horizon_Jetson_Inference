@@ -102,6 +102,12 @@ def result_row(source: str, result, gt: HorizonLine | None, running_fps: float) 
         "angle_correction": result.roi_log.get("angle_correction", np.nan),
         "candidate_count": result.roi_log.get("candidate_count", np.nan),
         "candidate_horizontal_span": result.roi_log.get("candidate_span", np.nan),
+        "trid_mode": result.roi_log.get("trid_mode", ""),
+        "trid_chunk_length": result.roi_log.get("trid_chunk_length", np.nan),
+        "trid_chunk_position": result.roi_log.get("trid_chunk_position", np.nan),
+        "trid_actual_chunk_frames": result.roi_log.get("trid_actual_chunk_frames", np.nan),
+        "trid_backbone_evals_total": result.roi_log.get("trid_backbone_evals_total", np.nan),
+        "trid_backbone_evals_amortized": result.roi_log.get("trid_backbone_evals_amortized", np.nan),
     }
 
 
@@ -146,9 +152,17 @@ def main() -> int:
     parser.add_argument("--roi-gate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--roi-width", type=int, default=None, help="Width used for CPU ROI refinement; lower values are faster on Jetson.")
     parser.add_argument("--roi-every", type=int, default=1, help="Run ROI refinement every N frames; skipped frames use the coarse line.")
+    parser.add_argument(
+        "--trid-mode",
+        choices=["chunk", "rolling", "single"],
+        default="chunk",
+        help="TRiD temporal execution. chunk matches the reported evaluation; rolling is streaming-style and recomputes the clip each frame; single is T=1.",
+    )
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-csv", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--show", action="store_true")
+    parser.add_argument("--profile-stages", action="store_true", help="Write a per-frame/per-method stage timing CSV.")
+    parser.add_argument("--profile-output", type=Path, default=None, help="Optional path for --profile-stages CSV.")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--manifest", type=Path, default=Path("samples/test_manifest.csv"))
@@ -158,12 +172,13 @@ def main() -> int:
     device = choose_device(args.device)
     fp16 = (device.type == "cuda") if args.fp16 is None else args.fp16
     methods = METHODS if args.method == "all" else [args.method]
-    runners = [MethodRunner(m, device, fp16, args.roi, args.roi_gate, args.roi_width, args.roi_every) for m in methods]
+    runners = [MethodRunner(m, device, fp16, args.roi, args.roi_gate, args.roi_width, args.roi_every, args.trid_mode) for m in methods]
     kind, source = open_input(args.input)
     gt_by_frame = load_manifest_gt(args.manifest, args.input)
     if gt_by_frame:
         print(f"Loaded GT for {len(gt_by_frame)} frames from {args.manifest}")
     rows: list[dict] = []
+    stage_rows: list[dict] = []
     writer = None
     video_writer = None
     start = time.perf_counter()
@@ -171,7 +186,11 @@ def main() -> int:
     frames = []
     fps = 25.0
     if kind == "images":
-        frames = [(i + 1, cv2.imread(str(p)), str(p)) for i, p in enumerate(source)]
+        for i, p in enumerate(source):
+            t_decode = time.perf_counter()
+            frame = cv2.imread(str(p))
+            decode_ms = (time.perf_counter() - t_decode) * 1000.0
+            frames.append((i + 1, frame, str(p), decode_ms))
     else:
         cap = cv2.VideoCapture(str(source))
         if not cap.isOpened():
@@ -179,16 +198,31 @@ def main() -> int:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
         idx = 0
         while True:
+            t_decode = time.perf_counter()
             ok, frame = cap.read()
+            decode_ms = (time.perf_counter() - t_decode) * 1000.0
             if not ok or (args.max_frames and idx >= args.max_frames):
                 break
             idx += 1
-            frames.append((idx, frame, str(source)))
+            frames.append((idx, frame, str(source), decode_ms))
         cap.release()
     if args.max_frames:
         frames = frames[: args.max_frames]
     for r in runners:
         r.reset()
+
+    trid_chunk_results: dict[int, object] = {}
+    if args.trid_mode == "chunk":
+        trid_runner = next((r for r in runners if r.method == "trid"), None)
+        if trid_runner is not None:
+            import config
+
+            print(f"Precomputing TRiD-Horizon in non-overlapping chunks of {config.CLIP_LENGTH} frames")
+            for start_i in range(0, len(frames), config.CLIP_LENGTH):
+                chunk = frames[start_i : start_i + config.CLIP_LENGTH]
+                items = [(frame_index, frame, gt_by_frame.get(frame_index)) for frame_index, frame, _, _ in chunk]
+                for res in trid_runner.predict_trid_chunk(items):
+                    trid_chunk_results[res.frame_index] = res
 
     csv_handle = None
     try:
@@ -197,9 +231,13 @@ def main() -> int:
             csv_path.parent.mkdir(parents=True, exist_ok=True)
             csv_handle = csv_path.open("w", newline="")
             writer = None
-        for frame_index, frame, src in frames:
+        for frame_index, frame, src, decode_ms in frames:
+            frame_wall_start = time.perf_counter()
             gt = gt_by_frame.get(frame_index)
-            results = [r.predict(frame, frame_index, gt) for r in runners]
+            results = [
+                trid_chunk_results[frame_index] if (r.method == "trid" and args.trid_mode == "chunk") else r.predict(frame, frame_index, gt)
+                for r in runners
+            ]
             elapsed = time.perf_counter() - start
             running_fps = frame_index / max(elapsed, 1e-9)
             for res in results:
@@ -212,25 +250,70 @@ def main() -> int:
                     writer.writerow(row)
                 if args.verbose:
                     print(row)
+            visualization_ms = 0.0
+            encode_ms = 0.0
             if args.output and args.save_video:
+                t_vis = time.perf_counter()
                 if args.method == "all":
                     vis = make_all_methods_montage(frame, results, gt, frame_index)
                 else:
                     vis = render_method_panel(frame, results[0], 1000.0 / max(results[0].timing["full_ms"], 1e-6))
+                visualization_ms = (time.perf_counter() - t_vis) * 1000.0
                 if video_writer is None:
                     out_video = args.output if args.output.suffix.lower() != ".csv" else args.output.with_suffix(".mp4")
                     out_video.parent.mkdir(parents=True, exist_ok=True)
                     video_writer = cv2.VideoWriter(str(out_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (vis.shape[1], vis.shape[0]))
+                t_encode = time.perf_counter()
                 video_writer.write(vis)
+                encode_ms = (time.perf_counter() - t_encode) * 1000.0
                 if args.show:
                     cv2.imshow("horizon", vis)
                     if cv2.waitKey(1) == 27:
                         break
+            if args.profile_stages:
+                frame_wall_ms = (time.perf_counter() - frame_wall_start) * 1000.0
+                for res in results:
+                    stage_rows.append(
+                        {
+                            "source": src,
+                            "frame_index": frame_index,
+                            "method": res.method,
+                            "decode_ms": decode_ms,
+                            "preprocess_ms": res.timing.get("preprocess_ms", np.nan),
+                            "model_forward_ms": res.timing.get("model_ms", np.nan),
+                            "postprocess_ms": res.timing.get("postprocess_ms", np.nan),
+                            "roi_ms": res.timing.get("roi_ms", np.nan),
+                            "visualization_ms": visualization_ms,
+                            "encode_ms": encode_ms,
+                            "method_full_pipeline_ms": res.timing.get("full_ms", np.nan),
+                            "frame_wall_ms": frame_wall_ms,
+                            "prediction_valid": int(res.prediction_valid),
+                            "roi_accepted": int(res.roi_accepted),
+                            "roi_reason": res.roi_reason,
+                            "trid_mode": res.roi_log.get("trid_mode", ""),
+                            "trid_chunk_length": res.roi_log.get("trid_chunk_length", np.nan),
+                            "trid_chunk_position": res.roi_log.get("trid_chunk_position", np.nan),
+                            "trid_backbone_evals_amortized": res.roi_log.get("trid_backbone_evals_amortized", np.nan),
+                        }
+                    )
     finally:
         if video_writer:
             video_writer.release()
         if csv_handle:
             csv_handle.close()
+        if args.profile_stages and stage_rows:
+            if args.profile_output is not None:
+                profile_path = args.profile_output
+            elif args.output is not None:
+                profile_path = args.output.with_name(args.output.stem + "_stage_profile.csv")
+            else:
+                profile_path = Path("outputs/run_inference_stage_profile.csv")
+            profile_path.parent.mkdir(parents=True, exist_ok=True)
+            with profile_path.open("w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(stage_rows[0].keys()))
+                w.writeheader()
+                w.writerows(stage_rows)
+            print(f"Wrote stage profile to {profile_path}")
         if args.show:
             try:
                 cv2.destroyAllWindows()

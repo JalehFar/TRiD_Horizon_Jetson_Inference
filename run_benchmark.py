@@ -17,7 +17,7 @@ from inference.geometry import HorizonLine
 from inference.pipeline import MethodRunner
 
 
-def environment_text(device: torch.device, precision: str, warmup: int, roi: bool, roi_gate: bool, roi_width: int | None, roi_every: int) -> str:
+def environment_text(device: torch.device, precision: str, warmup: int, roi: bool, roi_gate: bool, roi_width: int | None, roi_every: int, trid_mode: str) -> str:
     lines = [
         f"Python: {sys.version}",
         f"Platform: {platform.platform()}",
@@ -35,6 +35,7 @@ def environment_text(device: torch.device, precision: str, warmup: int, roi: boo
         f"ROI gate enabled: {roi_gate}",
         f"ROI processing width: {roi_width if roi_width is not None else 'default'}",
         f"ROI every N frames: {roi_every}",
+        f"TRiD temporal mode: {trid_mode}",
     ]
     try:
         lines.append("Git commit: " + subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip())
@@ -60,12 +61,18 @@ def main() -> int:
     parser.add_argument("--roi-gate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--roi-width", type=int, default=None)
     parser.add_argument("--roi-every", type=int, default=1)
+    parser.add_argument(
+        "--trid-mode",
+        choices=["chunk", "rolling", "single"],
+        default="chunk",
+        help="TRiD temporal execution. chunk matches the reported evaluation; rolling is streaming-style and recomputes the clip each frame; single is T=1.",
+    )
     args = parser.parse_args()
 
     args.output.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     precision = "fp16" if args.fp16 and device.type == "cuda" else "fp32"
-    (args.output / "benchmark_environment.txt").write_text(environment_text(device, precision, args.warmup, args.roi, args.roi_gate, args.roi_width, args.roi_every))
+    (args.output / "benchmark_environment.txt").write_text(environment_text(device, precision, args.warmup, args.roi, args.roi_gate, args.roi_width, args.roi_every, args.trid_mode))
     with args.manifest.open() as f:
         manifest_rows = list(csv.DictReader(f))
     by_video: dict[str, list[dict]] = {}
@@ -75,7 +82,7 @@ def main() -> int:
     failures = []
     all_rows = []
     for method in METHODS:
-        runner = MethodRunner(method, device, args.fp16, args.roi, args.roi_gate, args.roi_width, args.roi_every)
+        runner = MethodRunner(method, device, args.fp16, args.roi, args.roi_gate, args.roi_width, args.roi_every, args.trid_mode)
         for rel_path, rows in by_video.items():
             path = Path(rel_path)
             runner.reset()
@@ -84,18 +91,38 @@ def main() -> int:
                 if not cap.isOpened():
                     raise FileNotFoundError(path)
                 rows_sorted = sorted(rows, key=lambda r: int(r["frame_index"]))
-                start = time.perf_counter()
-                for i, row in enumerate(rows_sorted):
-                    if args.max_frames and i >= args.max_frames:
-                        break
+                selected_rows = rows_sorted[: args.max_frames] if args.max_frames else rows_sorted
+                decoded = []
+                for row in selected_rows:
                     ok, frame = cap.read()
                     if not ok:
                         raise RuntimeError(f"Could not read frame {row['frame_index']}")
-                    gt = HorizonLine(float(row["gt_y_left"]), float(row["gt_y_right"]), int(row["original_width"]), int(row["original_height"]))
-                    res = runner.predict(frame, int(row["frame_index"]), gt)
-                    out = result_row(rel_path, res, gt, (i + 1) / max(time.perf_counter() - start, 1e-9))
-                    out.update({"dataset": row["dataset"], "video": row["video"]})
-                    all_rows.append(out)
+                    decoded.append((row, frame))
+                start = time.perf_counter()
+                if method == "trid" and args.trid_mode == "chunk":
+                    import config
+
+                    frame_counter = 0
+                    for chunk_start in range(0, len(decoded), config.CLIP_LENGTH):
+                        chunk = decoded[chunk_start : chunk_start + config.CLIP_LENGTH]
+                        items = []
+                        item_rows = []
+                        for row, frame in chunk:
+                            gt = HorizonLine(float(row["gt_y_left"]), float(row["gt_y_right"]), int(row["original_width"]), int(row["original_height"]))
+                            items.append((int(row["frame_index"]), frame, gt))
+                            item_rows.append((row, gt))
+                        for res, (row, gt) in zip(runner.predict_trid_chunk(items), item_rows):
+                            frame_counter += 1
+                            out = result_row(rel_path, res, gt, frame_counter / max(time.perf_counter() - start, 1e-9))
+                            out.update({"dataset": row["dataset"], "video": row["video"]})
+                            all_rows.append(out)
+                else:
+                    for i, (row, frame) in enumerate(decoded):
+                        gt = HorizonLine(float(row["gt_y_left"]), float(row["gt_y_right"]), int(row["original_width"]), int(row["original_height"]))
+                        res = runner.predict(frame, int(row["frame_index"]), gt)
+                        out = result_row(rel_path, res, gt, (i + 1) / max(time.perf_counter() - start, 1e-9))
+                        out.update({"dataset": row["dataset"], "video": row["video"]})
+                        all_rows.append(out)
                 cap.release()
             except Exception as exc:
                 failures.append({"method": method, "input": rel_path, "error": repr(exc)})
