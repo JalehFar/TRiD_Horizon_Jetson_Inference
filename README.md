@@ -1,6 +1,6 @@
-# TRiD-Horizon Jetson Inference
+# TRiD-Horizon Inference
 
-Self-contained inference and benchmarking repository for the final horizon-line detection methods. The complete final test set is included under `samples/`, so no external dataset-preparation step is required.
+Self-contained inference and benchmarking repository for the final horizon-line detection methods. The complete final test set is included under `samples/`.
 
 ## Run one method
 
