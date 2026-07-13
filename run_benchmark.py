@@ -36,6 +36,8 @@ def environment_text(device: torch.device, precision: str, warmup: int, roi: boo
         f"ROI processing width: {roi_width if roi_width is not None else 'default'}",
         f"ROI every N frames: {roi_every}",
         f"TRiD temporal mode: {trid_mode}",
+        "Timing boundaries: model latency is neural forward/head only; full algorithm latency is preprocess + H2D + model + postprocess + ROI.",
+        "Decode, visualization, CSV writing, and video encoding are excluded from run_benchmark method latency.",
     ]
     try:
         lines.append("Git commit: " + subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip())
@@ -61,13 +63,19 @@ def main() -> int:
     parser.add_argument("--roi-gate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--roi-width", type=int, default=None)
     parser.add_argument("--roi-every", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=20260713)
     parser.add_argument(
         "--trid-mode",
-        choices=["chunk", "rolling", "single"],
-        default="chunk",
-        help="TRiD temporal execution. chunk matches the reported evaluation; rolling is streaming-style and recomputes the clip each frame; single is T=1.",
+        choices=["streaming", "rolling", "chunk", "single"],
+        default="streaming",
+        help="TRiD temporal execution. streaming is the deployment default; rolling recomputes history; chunk is offline/research-parity batching; single is T=1.",
     )
     args = parser.parse_args()
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     args.output.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)

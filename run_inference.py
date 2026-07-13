@@ -64,6 +64,10 @@ def load_manifest_gt(manifest_path: Path, input_path: Path) -> dict[int, Horizon
 
 def result_row(source: str, result, gt: HorizonLine | None, running_fps: float) -> dict:
     err = result.errors()
+    is_chunk_trid = result.roi_log.get("trid_mode", "") == "chunk"
+    model_ms = result.timing.get("model_ms", np.nan)
+    full_ms = result.timing.get("full_ms", np.nan)
+    amortized_chunk_ms = result.roi_log.get("amortized_chunk_compute_per_frame_ms", np.nan)
     def endpoints(line):
         return (np.nan, np.nan) if not is_valid_line(line) else (line.y_left, line.y_right)
     c_l, c_r = endpoints(result.coarse)
@@ -75,12 +79,19 @@ def result_row(source: str, result, gt: HorizonLine | None, running_fps: float) 
         "source": source,
         "frame_index": result.frame_index,
         "preprocess_ms": result.timing.get("preprocess_ms", np.nan),
-        "model_forward_ms": result.timing.get("model_ms", np.nan),
+        "h2d_ms": result.timing.get("h2d_ms", np.nan),
+        "model_forward_ms": model_ms,
+        "dce_backbone_ms": result.timing.get("dce_backbone_ms", np.nan),
+        "convgru_step_ms": result.timing.get("convgru_step_ms", np.nan),
+        "reduce_ms": result.timing.get("reduce_ms", np.nan),
+        "column_head_ms": result.timing.get("column_head_ms", np.nan),
+        "dsac_ms": result.timing.get("dsac_ms", np.nan),
         "postprocess_ms": result.timing.get("postprocess_ms", np.nan),
         "roi_ms": result.timing.get("roi_ms", np.nan),
-        "full_pipeline_ms": result.timing.get("full_ms", np.nan),
-        "model_only_fps": 1000.0 / max(result.timing.get("model_ms", 1e-6), 1e-6),
-        "full_pipeline_instant_fps": 1000.0 / max(result.timing.get("full_ms", 1e-6), 1e-6),
+        "full_pipeline_ms": full_ms,
+        "model_only_fps": np.nan if is_chunk_trid else 1000.0 / max(model_ms, 1e-6),
+        "full_pipeline_instant_fps": np.nan if is_chunk_trid else 1000.0 / max(full_ms, 1e-6),
+        "chunk_batch_throughput_fps": (1000.0 / max(amortized_chunk_ms, 1e-6)) if is_chunk_trid else np.nan,
         "running_average_throughput_fps": running_fps,
         "prediction_valid": int(result.prediction_valid),
         "roi_accepted": int(result.roi_accepted),
@@ -108,6 +119,13 @@ def result_row(source: str, result, gt: HorizonLine | None, running_fps: float) 
         "trid_actual_chunk_frames": result.roi_log.get("trid_actual_chunk_frames", np.nan),
         "trid_backbone_evals_total": result.roi_log.get("trid_backbone_evals_total", np.nan),
         "trid_backbone_evals_amortized": result.roi_log.get("trid_backbone_evals_amortized", np.nan),
+        "effective_history_length": result.roi_log.get("effective_history_length", np.nan),
+        "backbone_evaluations_this_frame": result.roi_log.get("backbone_evaluations_this_frame", np.nan),
+        "hidden_state_reset": result.roi_log.get("hidden_state_reset", np.nan),
+        "cache_hit": result.roi_log.get("cache_hit", np.nan),
+        "clip_id": result.roi_log.get("clip_id", ""),
+        "chunk_model_latency_ms": result.roi_log.get("chunk_model_latency_ms", np.nan),
+        "amortized_chunk_compute_per_frame_ms": result.roi_log.get("amortized_chunk_compute_per_frame_ms", np.nan),
     }
 
 
@@ -122,9 +140,24 @@ def _summarize_block(rows: list[dict], label: str, warmup: int) -> None:
     center = np.array([r["center_y_abs_error"] for r in timed], dtype=float)
     endpoint = np.array([r["mean_endpoint_abs_error"] for r in timed], dtype=float)
     angle = np.array([r["angular_error"] for r in timed], dtype=float)
-    print(f"model latency ms mean/median/p95: {np.nanmean(model):.3f} / {np.nanmedian(model):.3f} / {np.nanpercentile(model,95):.3f}")
-    print(f"full latency ms mean/median/p95: {np.nanmean(full):.3f} / {np.nanmedian(full):.3f} / {np.nanpercentile(full,95):.3f}")
-    print(f"latency-derived FPS model/full: {1000/np.nanmean(model):.2f} / {1000/np.nanmean(full):.2f}")
+    trid_mode_values = [str(r.get("trid_mode", "")) for r in timed]
+    trid_modes = {value for value in trid_mode_values if value}
+    all_rows_are_chunk_trid = bool(timed) and all(value == "chunk" for value in trid_mode_values)
+    if all_rows_are_chunk_trid:
+        chunk = np.array([r["chunk_model_latency_ms"] for r in timed], dtype=float)
+        amortized = np.array([r["amortized_chunk_compute_per_frame_ms"] for r in timed], dtype=float)
+        chunk_size = int(np.nanmedian(np.array([r["trid_chunk_length"] for r in timed], dtype=float)))
+        print(f"TRiD chunk size: {chunk_size}")
+        print(f"Chunk latency ms mean/median/p95: {np.nanmean(chunk):.3f} / {np.nanmedian(chunk):.3f} / {np.nanpercentile(chunk,95):.3f}")
+        print(f"Amortized chunk compute per frame ms mean/median/p95: {np.nanmean(amortized):.3f} / {np.nanmedian(amortized):.3f} / {np.nanpercentile(amortized,95):.3f}")
+        print(f"Batch throughput FPS from amortized compute: {1000/np.nanmean(amortized):.2f} (offline batch throughput, not streaming latency)")
+        print(f"full algorithm latency ms mean/median/p95: {np.nanmean(full):.3f} / {np.nanmedian(full):.3f} / {np.nanpercentile(full,95):.3f}")
+    else:
+        latency_label = "Streaming model latency" if "streaming" in trid_modes else "model latency"
+        full_label = "Streaming full-pipeline latency" if "streaming" in trid_modes else "full latency"
+        print(f"{latency_label} ms mean/median/p95: {np.nanmean(model):.3f} / {np.nanmedian(model):.3f} / {np.nanpercentile(model,95):.3f}")
+        print(f"{full_label} ms mean/median/p95: {np.nanmean(full):.3f} / {np.nanmedian(full):.3f} / {np.nanpercentile(full,95):.3f}")
+        print(f"latency-derived FPS model/full: {1000/np.nanmean(model):.2f} / {1000/np.nanmean(full):.2f}")
     print(f"center error mean/median/p95: {np.nanmean(center):.3f} / {np.nanmedian(center):.3f} / {np.nanpercentile(center,95):.3f}")
     print(f"endpoint mean error: {np.nanmean(endpoint):.3f}; angular mean error: {np.nanmean(angle):.3f}")
     print(f"ROI acceptance rate: {100*np.mean([r['roi_accepted'] for r in timed]):.2f}%")
@@ -154,9 +187,9 @@ def main() -> int:
     parser.add_argument("--roi-every", type=int, default=1, help="Run ROI refinement every N frames; skipped frames use the coarse line.")
     parser.add_argument(
         "--trid-mode",
-        choices=["chunk", "rolling", "single"],
-        default="chunk",
-        help="TRiD temporal execution. chunk matches the reported evaluation; rolling is streaming-style and recomputes the clip each frame; single is T=1.",
+        choices=["streaming", "rolling", "chunk", "single"],
+        default="streaming",
+        help="TRiD temporal execution. streaming is the deployment default; rolling recomputes history; chunk is offline/research-parity batching; single is T=1.",
     )
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-csv", action=argparse.BooleanOptionalAction, default=True)
@@ -166,8 +199,14 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--manifest", type=Path, default=Path("samples/test_manifest.csv"))
+    parser.add_argument("--seed", type=int, default=20260713)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     device = choose_device(args.device)
     fp16 = (device.type == "cuda") if args.fp16 is None else args.fp16
@@ -280,20 +319,33 @@ def main() -> int:
                             "method": res.method,
                             "decode_ms": decode_ms,
                             "preprocess_ms": res.timing.get("preprocess_ms", np.nan),
+                            "h2d_ms": res.timing.get("h2d_ms", np.nan),
                             "model_forward_ms": res.timing.get("model_ms", np.nan),
+                            "dce_backbone_ms": res.timing.get("dce_backbone_ms", np.nan),
+                            "convgru_step_ms": res.timing.get("convgru_step_ms", np.nan),
+                            "reduce_ms": res.timing.get("reduce_ms", np.nan),
+                            "column_head_ms": res.timing.get("column_head_ms", np.nan),
+                            "dsac_ms": res.timing.get("dsac_ms", np.nan),
                             "postprocess_ms": res.timing.get("postprocess_ms", np.nan),
                             "roi_ms": res.timing.get("roi_ms", np.nan),
                             "visualization_ms": visualization_ms,
                             "encode_ms": encode_ms,
-                            "method_full_pipeline_ms": res.timing.get("full_ms", np.nan),
-                            "frame_wall_ms": frame_wall_ms,
+                            "total_algorithm_ms": res.timing.get("full_ms", np.nan),
+                            "total_wall_ms": frame_wall_ms,
                             "prediction_valid": int(res.prediction_valid),
                             "roi_accepted": int(res.roi_accepted),
                             "roi_reason": res.roi_reason,
                             "trid_mode": res.roi_log.get("trid_mode", ""),
+                            "effective_history_length": res.roi_log.get("effective_history_length", np.nan),
+                            "backbone_evaluations_this_frame": res.roi_log.get("backbone_evaluations_this_frame", np.nan),
+                            "hidden_state_reset": res.roi_log.get("hidden_state_reset", np.nan),
+                            "cache_hit": res.roi_log.get("cache_hit", np.nan),
+                            "clip_id": res.roi_log.get("clip_id", ""),
                             "trid_chunk_length": res.roi_log.get("trid_chunk_length", np.nan),
                             "trid_chunk_position": res.roi_log.get("trid_chunk_position", np.nan),
                             "trid_backbone_evals_amortized": res.roi_log.get("trid_backbone_evals_amortized", np.nan),
+                            "chunk_model_latency_ms": res.roi_log.get("chunk_model_latency_ms", np.nan),
+                            "amortized_chunk_compute_per_frame_ms": res.roi_log.get("amortized_chunk_compute_per_frame_ms", np.nan),
                         }
                     )
     finally:

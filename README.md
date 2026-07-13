@@ -68,7 +68,7 @@ python3 run_benchmark.py \
 - `--no-roi-gate`: run ROI refinement without the conservative acceptance gate.
 - `--roi-width`: width used for CPU ROI refinement; lower is faster on Jetson.
 - `--roi-every`: run ROI refinement every N frames; skipped frames use the coarse line.
-- `--trid-mode`: temporal execution for `trid`; default `chunk` matches the reported evaluation.
+- `--trid-mode`: temporal execution for `trid`; default `streaming` is the deployment path.
 - `--profile-stages`: write a per-frame/per-method stage timing CSV.
 - `--profile-output`: optional path for the stage timing CSV.
 - `--max-frames`: stop after this many frames.
@@ -79,12 +79,13 @@ Defaults are CUDA if available, FP16 on CUDA, ROI refinement enabled, bounded RO
 
 ## TRiD temporal modes
 
-`TRiD-Horizon` defaults to `--trid-mode chunk`. This is the mode used by the final evaluation: frames are processed in non-overlapping clips of `CLIP_LENGTH=8`, the final short clip is padded by repeating its last frame, and model latency is reported as the clip forward time divided by 8.
+`TRiD-Horizon` defaults to `--trid-mode streaming`. This is the deployment path: each new frame runs through DCEUNet once, updates a persistent ConvGRU hidden state, and produces the current horizon. The temporal state resets only when a new runner/video starts.
 
 Other modes are available for diagnostics:
 
-- `--trid-mode rolling`: streaming-style rolling prefix. This recomputes up to 8 DCEUNet backbone passes for every output frame and is much slower.
-- `--trid-mode single`: one-frame temporal input (`T=1`). This is useful for isolating backbone/head latency, but it is not the final evaluated temporal pipeline.
+- `--trid-mode rolling`: recomputes the recent clip for every output frame. This is diagnostic only and is much slower because previous frames pass through DCEUNet again.
+- `--trid-mode chunk`: offline/research-parity batching. It processes non-overlapping clips of `CLIP_LENGTH=8` and resets ConvGRU state at chunk boundaries, matching the final publication evaluator. Its amortized compute per frame is batch throughput, not streaming latency.
+- `--trid-mode single`: one-frame temporal input (`T=1`). This is useful for isolating backbone/head latency.
 
 ## Jetson speed options
 
@@ -149,9 +150,9 @@ The terminal summary and CSV report:
 - angular error;
 - ROI acceptance rate.
 
-Model latency measures only neural-network forward time. Full-pipeline latency includes preprocessing, model forward, post-processing, and ROI refinement. Throughput FPS is measured from processed frames divided by elapsed wall time.
+Model latency measures neural-network forward time and method-specific differentiable geometric heads. Full-pipeline latency includes preprocessing, H2D transfer, model forward, post-processing, and ROI refinement. Throughput FPS is measured from processed frames divided by elapsed wall time.
 
-When `--profile-stages` is enabled, an additional CSV is written with decode, preprocess, model, postprocess, ROI, visualization, encode, and frame-wall timings. With `--method all`, the terminal summary prints a separate `Profile:` block for ESSLD, DirectReg-HL, WLS-HL, DSAC-HL, and TRiD-Horizon.
+When `--profile-stages` is enabled, an additional CSV is written with decode, preprocess, H2D, model sub-stages, postprocess, ROI, visualization, encode, and frame-wall timings. With `--method all`, the terminal summary prints a separate `Profile:` block for ESSLD, DirectReg-HL, WLS-HL, DSAC-HL, and TRiD-Horizon.
 
 ## Outputs
 

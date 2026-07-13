@@ -14,7 +14,7 @@ from inference.geometry import HorizonLine, is_valid_line, line_errors, line_fro
 from inference.postprocess import get_coarse_line_from_mask
 from inference.roi_gate import apply_bounded_roi
 from models.dceunet import DCEUNet
-from models.heads import DirectRegHL, DSACHL, TRiDHorizon, WLSHL
+from models.heads import DirectRegHL, DSACHL, TRiDHorizon, WLSHL, heatmap_to_points
 
 
 def sha256_file(path: Path) -> str:
@@ -43,7 +43,7 @@ def endpoints_norm_to_original(endpoints, width: int, height: int) -> HorizonLin
 def invalid_result(method: str, frame_index: int, timings: dict[str, float], gt: HorizonLine | None, reason: str) -> "FrameResult":
     timings.setdefault("postprocess_ms", 0.0)
     timings.setdefault("roi_ms", 0.0)
-    timings["full_ms"] = timings.get("preprocess_ms", 0.0) + timings.get("model_ms", 0.0) + timings.get("postprocess_ms", 0.0) + timings.get("roi_ms", 0.0)
+    timings["full_ms"] = timings.get("preprocess_ms", 0.0) + timings.get("h2d_ms", 0.0) + timings.get("model_ms", 0.0) + timings.get("postprocess_ms", 0.0) + timings.get("roi_ms", 0.0)
     return FrameResult(config.DISPLAY_NAMES[method], frame_index, None, None, None, False, False, reason, None, timings, {}, gt)
 
 
@@ -93,12 +93,21 @@ class MethodRunner:
         if self.fp16:
             self.model.half()
         self.clip_buffer: list[torch.Tensor] = []
+        self.stream_hidden: torch.Tensor | None = None
+        self.stream_history_length = 0
+        self.stream_pending_reset = True
         meta = config.CHECKPOINTS[method]
         extra = f" trid_mode={self.trid_mode}" if method == "trid" else ""
         print(f"method={method} checkpoint={meta['path']} sha256={sha256_file(meta['path'])} device={device} precision={'fp16' if self.fp16 else 'fp32'} input={config.IMAGE_WIDTH}x{config.IMAGE_HEIGHT}{extra}")
 
     def reset(self) -> None:
         self.clip_buffer = []
+        self.reset_stream_state()
+
+    def reset_stream_state(self) -> None:
+        self.stream_hidden = None
+        self.stream_history_length = 0
+        self.stream_pending_reset = True
 
     def _load_model(self):
         meta = config.CHECKPOINTS[self.method]
@@ -120,6 +129,17 @@ class MethodRunner:
             if missing or unexpected:
                 raise RuntimeError(f"Incompatible checkpoint {path}: missing={missing}, unexpected={unexpected}")
         return model.to(self.device)
+
+    def _time_op(self, fn):
+        start_wall = time.perf_counter()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+            ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            ev0.record()
+            out = fn()
+            ev1.record()
+            return out, cuda_time_ms(ev0, ev1)
+        return fn(), (time.perf_counter() - start_wall) * 1000.0
 
     def _finish_from_coarse(
         self,
@@ -144,7 +164,7 @@ class MethodRunner:
         if self.roi and not run_roi:
             roi_log["reason"] = f"roi_skipped_every_{self.roi_every}"
         timings["roi_ms"] = (time.perf_counter() - t_roi) * 1000.0
-        timings["full_ms"] = timings["preprocess_ms"] + timings["model_ms"] + timings["postprocess_ms"] + timings["roi_ms"]
+        timings["full_ms"] = timings["preprocess_ms"] + timings.get("h2d_ms", 0.0) + timings["model_ms"] + timings["postprocess_ms"] + timings["roi_ms"]
         final = roi_log.get("final")
         if not is_valid_line(final):
             roi_log["final"] = coarse
@@ -159,7 +179,8 @@ class MethodRunner:
         t0 = time.perf_counter()
         tensor = preprocess(frame_bgr)
         timings["preprocess_ms"] = (time.perf_counter() - t0) * 1000.0
-        x = tensor.to(self.device)
+        x, h2d_ms = self._time_op(lambda: tensor.to(self.device))
+        timings["h2d_ms"] = h2d_ms
         if self.fp16:
             x = x.half()
         model_start_wall = time.perf_counter()
@@ -177,6 +198,17 @@ class MethodRunner:
             coarse_tuple = get_coarse_line_from_mask(mask, frame_bgr)
             coarse = None if coarse_tuple is None else line_from_center_angle(coarse_tuple[0], coarse_tuple[1], frame_bgr.shape[1], frame_bgr.shape[0])
         elif self.method == "trid":
+            if self.trid_mode == "streaming":
+                coarse, stream_timings, stream_extra = self.forward_stream_step(x, frame_bgr.shape[1], frame_bgr.shape[0])
+                timings.update(stream_timings)
+                timings["model_ms"] = (
+                    timings.get("dce_backbone_ms", 0.0)
+                    + timings.get("convgru_step_ms", 0.0)
+                    + timings.get("reduce_ms", 0.0)
+                    + timings.get("column_head_ms", 0.0)
+                    + timings.get("dsac_ms", 0.0)
+                )
+                return self._finish_from_coarse(frame_bgr, frame_index, gt, coarse, timings, stream_extra)
             if self.trid_mode == "single":
                 seq_cpu = [x[0].detach().cpu()]
             else:
@@ -205,6 +237,47 @@ class MethodRunner:
         return self._finish_from_coarse(frame_bgr, frame_index, gt, coarse, timings)
 
     @torch.no_grad()
+    def forward_stream_step(self, x: torch.Tensor, width: int, height: int) -> tuple[HorizonLine, dict[str, float], dict]:
+        hidden_was_reset = self.stream_hidden is None
+        feats, dce_ms = self._time_op(lambda: self.model.backbone(x))
+        enhanced = feats["enhanced"]
+
+        def convgru_step():
+            self.stream_hidden = self.model.temporal.cell(enhanced, self.stream_hidden)
+            return self.stream_hidden
+
+        hidden, convgru_ms = self._time_op(convgru_step)
+        reduced, reduce_ms = self._time_op(lambda: self.model.reduce(hidden))
+        cols, column_ms = self._time_op(lambda: self.model.column_head(reduced))
+
+        def dsac_step():
+            x_cols, y_cols, conf = heatmap_to_points(cols["heat_logits"], cols["confidence_logits"])
+            fit = self.model.dsac(x_cols, y_cols, conf)
+            return ((fit["endpoints_norm"] + 1.0) * 0.5).clamp(0.0, 1.0)
+
+        endpoints_tensor, dsac_ms = self._time_op(dsac_step)
+        endpoints = endpoints_tensor[0].float().cpu().numpy()
+        self.stream_hidden = hidden.detach()
+        self.stream_history_length += 1
+        self.stream_pending_reset = False
+        timings = {
+            "dce_backbone_ms": dce_ms,
+            "convgru_step_ms": convgru_ms,
+            "reduce_ms": reduce_ms,
+            "column_head_ms": column_ms,
+            "dsac_ms": dsac_ms,
+        }
+        extra = {
+            "trid_mode": "streaming",
+            "effective_history_length": self.stream_history_length,
+            "backbone_evaluations_this_frame": 1,
+            "hidden_state_reset": int(hidden_was_reset),
+            "cache_hit": 0,
+            "clip_id": "",
+        }
+        return endpoints_norm_to_original(endpoints, width, height), timings, extra
+
+    @torch.no_grad()
     def predict_trid_chunk(self, items: list[tuple[int, np.ndarray, HorizonLine | None]]) -> list[FrameResult]:
         if self.method != "trid":
             raise RuntimeError("predict_trid_chunk is only valid for TRiD-Horizon")
@@ -223,7 +296,7 @@ class MethodRunner:
         seq_cpu = torch.stack(tensors[: config.CLIP_LENGTH], dim=0)
         preprocess_ms_total = (time.perf_counter() - t0) * 1000.0
 
-        seq = seq_cpu.unsqueeze(0).to(self.device)
+        seq, h2d_ms_total = self._time_op(lambda: seq_cpu.unsqueeze(0).to(self.device))
         if self.fp16:
             seq = seq.half()
         model_start_wall = time.perf_counter()
@@ -241,9 +314,10 @@ class MethodRunner:
         endpoints_all = out["endpoints_norm01"][0, :actual_count].float().cpu().numpy()
         results: list[FrameResult] = []
         preprocess_each = preprocess_ms_total / float(actual_count)
+        h2d_each = h2d_ms_total / float(actual_count)
         model_each = model_ms_total / float(config.CLIP_LENGTH)
         for local_i, (frame_index, frame, gt, endpoints) in enumerate(zip(frame_indices, frames, gts, endpoints_all)):
-            timings = {"preprocess_ms": preprocess_each, "model_ms": model_each}
+            timings = {"preprocess_ms": preprocess_each, "h2d_ms": h2d_each, "model_ms": model_each}
             coarse = endpoints_norm_to_original(endpoints, frame.shape[1], frame.shape[0])
             extra = {
                 "trid_mode": "chunk",
@@ -252,6 +326,12 @@ class MethodRunner:
                 "trid_actual_chunk_frames": actual_count,
                 "trid_backbone_evals_total": config.CLIP_LENGTH,
                 "trid_backbone_evals_amortized": 1.0,
+                "chunk_model_latency_ms": model_ms_total,
+                "amortized_chunk_compute_per_frame_ms": model_each,
+                "backbone_evaluations_this_frame": "",
+                "hidden_state_reset": 1 if local_i == 0 else 0,
+                "cache_hit": 0,
+                "clip_id": frame_indices[0],
             }
             results.append(self._finish_from_coarse(frame, frame_index, gt, coarse, timings, extra))
         return results
