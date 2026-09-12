@@ -15,13 +15,12 @@ import numpy as np
 import torch
 
 
-REPO = Path.cwd()
-FAST_HORIZON_DIR = REPO.parent / "TRiD_Horizon" / "external_baselines" / "fast_horizon"
+REPO = Path(__file__).resolve().parents[1]
+FAST_HORIZON_DIR = REPO / "external" / "fast_horizon"
 sys.path.insert(0, str(REPO))
-sys.path.insert(0, str(FAST_HORIZON_DIR))
+sys.path.insert(0, str(FAST_HORIZON_DIR / "original"))
 
 from inference.pipeline import MethodRunner
-import fast_horizon_benchmark_standalone as fast_benchmark
 from FastHorizonAlg import FastHorizon
 
 
@@ -126,7 +125,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required; torch.cuda.is_available() is False")
 
-    git_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    git_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
     print("repository:", REPO)
     print("git_commit:", git_hash)
     print("gpu:", torch.cuda.get_device_name(0))
@@ -143,7 +142,7 @@ def main() -> None:
     print("timed_fast_region: original FastHorizon.get_horizon(frame, get_image=False)")
     print("decode/output/visualization/printing: excluded")
 
-    source = fast_benchmark.BASELINE_DIR / "original" / "FastHorizonAlg.py"
+    source = FAST_HORIZON_DIR / "original" / "FastHorizonAlg.py"
     print("fast_horizon_source_sha256:", hashlib.sha256(source.read_bytes()).hexdigest())
 
     runners = {
