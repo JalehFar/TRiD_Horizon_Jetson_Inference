@@ -1,6 +1,6 @@
 """
 Official Python implementation of "A fast horizon detector and a new annotated dataset for maritime video processing",
-a paper currently under review by Journal of Image and Graphics (United Kingdom).
+a paper published by Journal of Image and Graphics (United Kingdom).
 
 Implementation by Yassir Zardoua
 """
