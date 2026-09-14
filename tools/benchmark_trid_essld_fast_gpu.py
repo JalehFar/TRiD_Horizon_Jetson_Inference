@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import cv2
@@ -19,6 +20,13 @@ REPO = Path(__file__).resolve().parents[1]
 FAST_HORIZON_DIR = REPO / "external" / "fast_horizon"
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(FAST_HORIZON_DIR / "original"))
+
+# FastHorizonAlg imports tkinter for its optional video_demo GUI. The benchmark
+# calls get_horizon directly, so a module-only shim is sufficient on headless hosts.
+try:
+    import tkinter  # noqa: F401
+except ModuleNotFoundError:
+    sys.modules["tkinter"] = types.ModuleType("tkinter")
 
 from inference.pipeline import MethodRunner
 from FastHorizonAlg import FastHorizon
