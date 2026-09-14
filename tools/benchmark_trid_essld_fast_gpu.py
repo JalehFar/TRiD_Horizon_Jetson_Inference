@@ -25,7 +25,6 @@ from FastHorizonAlg import FastHorizon
 
 
 WARMUP_FRAMES = 5
-TIMED_FRAMES = 100
 DEVICE = torch.device("cuda")
 FP16 = False
 ROI_ENABLED = True
@@ -35,9 +34,14 @@ ROI_EVERY = 1
 TRID_MODE = "streaming"
 
 VIDEOS = [
-    ("TMD_video_5", REPO / "samples/TMD/TMD_annotated_5.avi"),
-    ("SeaClips_video_12", REPO / "samples/video_12.mp4"),
+    ("Buoy_buoyGT_2_5_3_5", REPO / "samples/Buoy/buoyGT_2_5_3_5.avi"),
+    ("Buoy_buoyGT_2_6_3_1", REPO / "samples/Buoy/buoyGT_2_6_3_1.avi"),
+    ("SMD_MVI_0788", REPO / "samples/SMD/MVI_0788_VIS_OB.mp4"),
     ("SMD_MVI_0790", REPO / "samples/SMD/MVI_0790_VIS_OB.mp4"),
+    ("TMD_TMD_annotated_15", REPO / "samples/TMD/TMD_annotated_15.avi"),
+    ("TMD_TMD_annotated_16", REPO / "samples/TMD/TMD_annotated_16.avi"),
+    ("TMD_TMD_annotated_17", REPO / "samples/TMD/TMD_annotated_17.avi"),
+    ("TMD_TMD_annotated_5", REPO / "samples/TMD/TMD_annotated_5.avi"),
 ]
 METHODS = ["trid", "essld", "fast_horizon"]
 DISPLAY_NAMES = {
@@ -52,15 +56,14 @@ def read_frames(path: Path) -> list[np.ndarray]:
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {path}")
     frames = []
-    for _ in range(WARMUP_FRAMES + TIMED_FRAMES):
+    while True:
         ok, frame = capture.read()
         if not ok:
             break
         frames.append(frame)
     capture.release()
-    required = WARMUP_FRAMES + TIMED_FRAMES
-    if len(frames) != required:
-        raise RuntimeError(f"{path}: decoded {len(frames)} frames; need {required}")
+    if len(frames) <= WARMUP_FRAMES:
+        raise RuntimeError(f"{path}: decoded {len(frames)} frames; need more than {WARMUP_FRAMES}")
     return frames
 
 
@@ -137,7 +140,7 @@ def main() -> None:
     print("roi_width:", ROI_WIDTH)
     print("roi_every:", ROI_EVERY)
     print("warmup_frames:", WARMUP_FRAMES)
-    print("timed_frames_per_video:", TIMED_FRAMES)
+    print("timed_frames_per_video: all frames after warm-up")
     print("timed_neural_region: MethodRunner.predict including preprocessing, transfer, model, postprocessing, and ROI")
     print("timed_fast_region: original FastHorizon.get_horizon(frame, get_image=False)")
     print("decode/output/visualization/printing: excluded")
