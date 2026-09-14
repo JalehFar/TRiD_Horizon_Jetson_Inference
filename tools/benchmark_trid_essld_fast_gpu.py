@@ -28,6 +28,26 @@ try:
 except ModuleNotFoundError:
     sys.modules["tkinter"] = types.ModuleType("tkinter")
 
+# OpenCV 4.x exposes this factory positionally, while the original source
+# passes only its two Canny thresholds using legacy underscored keywords.
+_fast_line_detector_factory = cv2.ximgproc.createFastLineDetector
+
+
+def _compat_fast_line_detector(*args, **kwargs):
+    if "_canny_th1" not in kwargs and "_canny_th2" not in kwargs:
+        return _fast_line_detector_factory(*args, **kwargs)
+    return _fast_line_detector_factory(
+        10,
+        1.4142135623730951,
+        kwargs.pop("_canny_th1"),
+        kwargs.pop("_canny_th2"),
+        3,
+        False,
+    )
+
+
+cv2.ximgproc.createFastLineDetector = _compat_fast_line_detector
+
 from inference.pipeline import MethodRunner
 from FastHorizonAlg import FastHorizon
 
